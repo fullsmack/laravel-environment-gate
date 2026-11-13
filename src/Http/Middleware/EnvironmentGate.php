@@ -3,7 +3,9 @@
 namespace FullSmack\EnvironmentGate\Http\Middleware;
 
 use Closure;
-use FullSmack\EnvironmentGate\Codes;
+use FullSmack\EnvironmentGate\Contracts\CredentialProvider;
+use FullSmack\EnvironmentGate\Credential;
+use FullSmack\EnvironmentGate\Credentials;
 use FullSmack\EnvironmentGate\CookieSigner;
 use FullSmack\EnvironmentGate\Events\EnvironmentUnlocked;
 use FullSmack\EnvironmentGate\Events\UnlockFailed;
@@ -66,9 +68,9 @@ class EnvironmentGate
             return $next($request);
         }
 
-        $codes = $this->codes();
+        $credentials = $this->credentials();
 
-        if ($this->hasValidCookie($request, $codes))
+        if ($this->hasValidCookie($request, $credentials))
         {
             return $next($request);
         }
@@ -79,7 +81,7 @@ class EnvironmentGate
         {
             return $this->attempt(
                 $request,
-                $codes,
+                $credentials,
                 (string) $request->headers->get($header),
                 'header',
                 onSuccess: fn () => $next($request),
@@ -94,13 +96,12 @@ class EnvironmentGate
 
             return $this->attempt(
                 $request,
-                $codes,
+                $credentials,
                 is_string($code) ? $code : '',
                 'link',
-                onSuccess: fn (string $label) => $this->unlockAndRedirect(
+                onSuccess: fn (Credential $credential) => $this->unlockAndRedirect(
                     $request,
-                    $codes,
-                    $label,
+                    $credential,
                     $this->urlWithoutParameter($request, $parameter),
                 ),
             );
@@ -132,14 +133,12 @@ class EnvironmentGate
         }
 
         $code = $request->input('code');
-        $codes = $this->codes();
-
         return $this->attempt(
             $request,
-            $codes,
+            $this->credentials(),
             is_string($code) ? trim($code) : '',
             'form',
-            onSuccess: fn (string $label) => $this->unlockAndRedirect($request, $codes, $label, $redirect),
+            onSuccess: fn (Credential $credential) => $this->unlockAndRedirect($request, $credential, $redirect),
             // The form page is never disguised as a 404, even in stealth mode.
             onFailure: fn (string $error, int $status) => $this->form(
                 $request,
@@ -153,10 +152,10 @@ class EnvironmentGate
     /**
      * Throttle, verify a submitted code and continue with the outcome.
      *
-     * @param  Closure(string): Response  $onSuccess
+     * @param  Closure(Credential): Response  $onSuccess
      * @param  (Closure(string, int): Response)|null  $onFailure
      */
-    protected function attempt(Request $request, Codes $codes, string $code, string $via, Closure $onSuccess, ?Closure $onFailure = null): Response
+    protected function attempt(Request $request, CredentialProvider $credentials, string $code, string $via, Closure $onSuccess, ?Closure $onFailure = null): Response
     {
         $onFailure ??= fn (string $error, int $status) => $this->locked($request, $error, $status);
 
@@ -171,9 +170,9 @@ class EnvironmentGate
             });
         }
 
-        $label = $code === '' ? null : $codes->match($code);
+        $credential = $code === '' ? null : $credentials->match($code);
 
-        if ($label === null)
+        if ($credential === null)
         {
             $limiter?->hit($key, (int) $this->config->get('environment-gate.throttle.decay_seconds', 60));
             $this->log('notice', 'Environment gate: invalid code', ['via' => $via, 'ip' => $request->ip()]);
@@ -184,18 +183,25 @@ class EnvironmentGate
 
         // Header access happens on every machine request, keep it quiet.
         $this->log($via === 'header' ? 'debug' : 'info', 'Environment gate: unlocked', [
-            'label' => $label, 'via' => $via, 'ip' => $request->ip(),
+            'label' => $credential->label, 'source' => $credential->source, 'via' => $via, 'ip' => $request->ip(),
         ]);
-        $this->events()->dispatch(new EnvironmentUnlocked($label, $via, $request));
+        $this->events()->dispatch(new EnvironmentUnlocked($credential->label, $via, $request, $credential->source));
 
-        return $onSuccess($label);
+        return $onSuccess($credential);
     }
 
-    protected function unlockAndRedirect(Request $request, Codes $codes, string $label, string $to): Response
+    protected function unlockAndRedirect(Request $request, Credential $credential, string $to): Response
     {
         $lifetime = max(1, (int) $this->config->get('environment-gate.cookie.lifetime', 43200));
         $expiresAt = time() + $lifetime * 60;
-        $value = $this->signer()->issue($label, (string) $codes->get($label), $expiresAt);
+
+        // A cookie never outlives the token it was issued for.
+        if ($credential->expiresAt !== null)
+        {
+            $expiresAt = min($expiresAt, $credential->expiresAt);
+        }
+
+        $value = $this->signer()->issue($credential, $expiresAt);
         $secure = $this->config->get('environment-gate.cookie.secure');
 
         $response = new RedirectResponse($to, Response::HTTP_FOUND);
@@ -214,11 +220,11 @@ class EnvironmentGate
         return $this->noStore($response);
     }
 
-    protected function hasValidCookie(Request $request, Codes $codes): bool
+    protected function hasValidCookie(Request $request, CredentialProvider $credentials): bool
     {
         $value = $request->cookies->all()[$this->cookieName()] ?? null;
 
-        return is_string($value) && $this->signer()->verify($value, $codes, time()) !== null;
+        return is_string($value) && $this->signer()->verify($value, $credentials, time()) !== null;
     }
 
     protected function locked(Request $request, ?string $error = null, ?int $status = null): Response
@@ -365,9 +371,9 @@ class EnvironmentGate
         return (string) $this->config->get('environment-gate.cookie.name', 'environment_gate');
     }
 
-    protected function codes(): Codes
+    protected function credentials(): CredentialProvider
     {
-        return $this->app->make(Codes::class);
+        return $this->app->make(Credentials::class);
     }
 
     protected function signer(): CookieSigner

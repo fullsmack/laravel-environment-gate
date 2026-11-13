@@ -33,6 +33,37 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Database tokens
+    |--------------------------------------------------------------------------
+    |
+    | Store access tokens in the database instead of (or next to) the codes
+    | above, managed with the environment-gate:token:* commands. Only a hash
+    | of each token is stored.
+    |
+    | Database tokens are only active where the gate itself is enabled too.
+    | The migration is loaded (and, when published, run) only there, so
+    | production and other ungated environments never get the table.
+    |
+    | The table name is "table_prefix" + "table". A prefix configured on the
+    | database connection itself is applied on top of that by Laravel.
+    |
+    | Token lookups for cookie-authenticated requests are cached for
+    | "cache_seconds" (0 disables caching). Revoking a token from the CLI
+    | clears its cache entry immediately.
+    |
+    */
+
+    'database' => [
+        'enabled' => (bool) env('ENVIRONMENT_GATE_DATABASE', false),
+        'connection' => env('ENVIRONMENT_GATE_DB_CONNECTION'),
+        'table' => env('ENVIRONMENT_GATE_DB_TABLE', 'environment_gate_tokens'),
+        'table_prefix' => env('ENVIRONMENT_GATE_DB_TABLE_PREFIX', ''),
+        'cache_seconds' => (int) env('ENVIRONMENT_GATE_DB_CACHE_SECONDS', 300),
+        'cache_store' => env('ENVIRONMENT_GATE_DB_CACHE_STORE'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Signing key
     |--------------------------------------------------------------------------
     |

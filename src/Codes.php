@@ -2,12 +2,13 @@
 
 namespace FullSmack\EnvironmentGate;
 
+use FullSmack\EnvironmentGate\Contracts\CredentialProvider;
 use InvalidArgumentException;
 
 /**
  * The configured access codes, keyed by label.
  */
-final class Codes
+final class Codes implements CredentialProvider
 {
     public const LABEL_PATTERN = '/^[A-Za-z0-9_-]+$/';
 
@@ -89,10 +90,10 @@ final class Codes
     }
 
     /**
-     * Find the label of the code matching the given input, comparing in
-     * constant time against every configured code.
+     * Find the code matching the given input, comparing in constant time
+     * against every configured code.
      */
-    public function match(string $input): ?string
+    public function match(string $input): ?Credential
     {
         $found = null;
 
@@ -104,7 +105,14 @@ final class Codes
             }
         }
 
-        return $found;
+        return $found === null ? null : $this->find($found);
+    }
+
+    public function find(string $label): ?Credential
+    {
+        return isset($this->codes[$label])
+            ? new Credential($label, $this->codes[$label], Credential::SOURCE_CONFIG)
+            : null;
     }
 
     public function get(string $label): ?string

@@ -2,8 +2,14 @@
 
 namespace FullSmack\EnvironmentGate;
 
+use FullSmack\EnvironmentGate\Console\CreateTokenCommand;
 use FullSmack\EnvironmentGate\Console\GenerateCodeCommand;
 use FullSmack\EnvironmentGate\Console\LinkCommand;
+use FullSmack\EnvironmentGate\Console\ListTokensCommand;
+use FullSmack\EnvironmentGate\Console\RevokeTokenCommand;
+use FullSmack\EnvironmentGate\Contracts\CredentialProvider;
+use FullSmack\EnvironmentGate\Database\TokenRepository;
+use FullSmack\EnvironmentGate\Database\TokenTable;
 use FullSmack\EnvironmentGate\Http\Middleware\EnvironmentGate;
 use Illuminate\Contracts\Http\Kernel as HttpKernel;
 use Illuminate\Cookie\Middleware\EncryptCookies;
@@ -24,6 +30,33 @@ class EnvironmentGateServiceProvider extends ServiceProvider
         $this->app->bind(CookieSigner::class, fn ($app) => new CookieSigner(
             (string) ($app['config']->get('environment-gate.key') ?: $app['config']->get('app.key')),
         ));
+
+        $this->app->bind(TokenRepository::class, function ($app) {
+            $config = $app['config']->get('environment-gate.database');
+            $seconds = (int) ($config['cache_seconds'] ?? 0);
+
+            return new TokenRepository(
+                $app->make('db'),
+                TokenTable::connection($app['config']),
+                TokenTable::name($app['config']),
+                $seconds > 0 ? $app->make('cache')->store($config['cache_store'] ?? null) : null,
+                $seconds,
+                $app->make('log'),
+            );
+        });
+
+        $this->app->bind(Credentials::class, function ($app) {
+            $providers = [$app->make(Codes::class)];
+
+            if (TokenTable::active($app['config']))
+            {
+                $providers[] = $app->make(TokenRepository::class);
+            }
+
+            return new Credentials($providers);
+        });
+
+        $this->app->alias(Credentials::class, CredentialProvider::class);
     }
 
     public function boot(): void
@@ -45,13 +78,27 @@ class EnvironmentGateServiceProvider extends ServiceProvider
                 __DIR__.'/../lang' => $this->app->langPath('vendor/environment-gate'),
             ], 'environment-gate-lang');
 
+            $this->publishes([
+                __DIR__.'/../database/migrations' => $this->app->databasePath('migrations'),
+            ], 'environment-gate-migrations');
+
             $this->commands([
                 LinkCommand::class,
                 GenerateCodeCommand::class,
+                CreateTokenCommand::class,
+                ListTokensCommand::class,
+                RevokeTokenCommand::class,
             ]);
         }
 
         $config = $this->app->make('config');
+
+        // Only environments where the gate and its database tokens are enabled
+        // get the migration, so `migrate` never creates the table elsewhere.
+        if (TokenTable::active($config))
+        {
+            $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
+        }
 
         if ($config->get('environment-gate.enabled') && $config->get('environment-gate.register_middleware', true))
         {

@@ -9,6 +9,7 @@ Lock staging, demo and preview environments behind a shareable access gate, **wi
 - **Unlock form**: `/__access`.
 - **Machine access**: an `X-Environment-Gate: <code>` header for API clients, Postman, E2E tests and CI smoke tests.
 - **Named codes** per person or client, so you can revoke one without logging everyone else out.
+- **Database tokens** (optional): issue, list and revoke tokens from the CLI without redeploying.
 - Only HTTP requests are gated. Queues, the scheduler and Artisan keep running.
 
 It's built for [Laravel Vapor](https://vapor.laravel.com) but works on any platform (Forge, Cloud, Docker, shared hosting).
@@ -48,6 +49,50 @@ php artisan environment-gate:link client-acme
 php artisan environment-gate:link client-acme --url=https://staging.example.com/events/42
 ```
 
+## Database tokens
+
+Env codes need a redeploy to change on Vapor. To issue and revoke access on the fly, store tokens in the database instead, or alongside the env codes.
+
+```dotenv
+ENVIRONMENT_GATE_DATABASE=true
+```
+
+Database tokens are only active where **both** `ENVIRONMENT_GATE_ENABLED` and `ENVIRONMENT_GATE_DATABASE` are true. Only there does the package load its migration, so `php artisan migrate` (including Vapor's deploy hook) creates the table on staging and demo, and never in production or anywhere else the gate is off.
+
+To keep the migration in your app instead, publish it with `php artisan vendor:publish --tag=environment-gate-migrations`. The published copy has a `shouldRun()` guard, so on Laravel 12+ it's skipped where the package isn't enabled. A skipped migration isn't recorded as run, so it still runs if you enable the package there later. Laravel 10 and 11 don't support `shouldRun()` and would create the empty table everywhere, so prefer the default (unpublished) migration there.
+
+**Table name.** The table is `environment_gate_tokens` by default. Use `ENVIRONMENT_GATE_DB_TABLE_PREFIX` to prefix it, or `ENVIRONMENT_GATE_DB_TABLE` to rename it. A `prefix` set on the database connection is applied on top, as usual in Laravel. For example, a connection prefix `app_` and a table prefix `gate_` give `app_gate_environment_gate_tokens`.
+
+Manage tokens from the CLI:
+
+```bash
+php artisan environment-gate:token:create client-acme --expires=30 --description="Acme UAT"
+#   Token   Hk2v9...
+#   Link    https://staging.example.com/?access=Hk2v9...
+#   Header  X-Environment-Gate: Hk2v9...
+
+php artisan environment-gate:token:create ci --token="$CI_GATE_TOKEN"   # set a specific value
+php artisan environment-gate:token:create client-acme --force           # replace (rotate) a token
+php artisan environment-gate:token:list                                  # labels, expiry, last use; never secrets
+php artisan environment-gate:token:revoke client-acme                    # logs its holders out immediately
+php artisan environment-gate:token:revoke --expired                      # clean up expired tokens
+```
+
+On Vapor, run the same commands with `vapor command staging --command="environment-gate:token:create client-acme --expires=30"`. The output, which includes the token, is visible in the Vapor command log.
+
+How tokens work:
+
+- **Only a SHA-256 hash is stored.** The token is shown once, when you create it, and `environment-gate:link` can't print it later.
+- `--expires` takes a number of days or a date. Access cookies never outlive the token they were issued for.
+- Labels must be unique across env codes and database tokens. Tokens must be at least 16 characters, without spaces or commas.
+- `last_used_at` is updated on link, form and header unlocks, at most every 15 minutes.
+
+Lookups and performance:
+
+- A request without a cookie never queries the database, and neither does a forged cookie. Cookies carry a second signature that only uses the key, which is checked before any lookup.
+- Requests with a valid cookie look the token up by label. The result is cached for `ENVIRONMENT_GATE_DB_CACHE_SECONDS` (default 300) in the default cache store, which is DynamoDB on Vapor. Revoking or replacing a token from the CLI clears its cache entry right away.
+- If the table is missing or the database is unreachable, the gate fails closed: database tokens are rejected and a warning is logged, but env codes keep working.
+
 ## How it works
 
 | Request | Result |
@@ -65,7 +110,12 @@ Every response in a gated environment gets `X-Robots-Tag: noindex, nofollow`, in
 
 ### The cookie
 
-The value is `label.expires.hmac(label, expires, code)`, signed with `APP_KEY` (or `ENVIRONMENT_GATE_KEY`). It's `HttpOnly`, `SameSite=Lax`, and `Secure` whenever the request is HTTPS. It lasts 30 days by default, and the expiry is also enforced server-side.
+The value is `label.expires.envelope.signature`, signed with `APP_KEY` (or `ENVIRONMENT_GATE_KEY`):
+
+- `envelope` is `hmac(label, expires)`, checked first using only the key.
+- `signature` is `hmac(label, expires, secret)`. The secret is the code itself, or the stored hash for a database token.
+
+The cookie is `HttpOnly`, `SameSite=Lax`, and `Secure` whenever the request is HTTPS. It lasts 30 days by default, and the expiry is also enforced server-side.
 
 - **Revoke** a person: remove their entry from `ENVIRONMENT_GATE_CODES`. Their cookies stop working, everyone else's keep working.
 - **Rotate** a code: change it. Cookies issued for the old code stop working.
@@ -101,6 +151,12 @@ php artisan vendor:publish --tag=environment-gate-config
 | `ENVIRONMENT_GATE_ENABLED` | `false` | Turn the gate on |
 | `ENVIRONMENT_GATE_CODES` | | `label:code,label:code`. Labels may contain `A-Z a-z 0-9 - _` |
 | `ENVIRONMENT_GATE_KEY` | `APP_KEY` | Cookie signing key |
+| `ENVIRONMENT_GATE_DATABASE` | `false` | Enable database tokens and their migration (requires `ENVIRONMENT_GATE_ENABLED`) |
+| `ENVIRONMENT_GATE_DB_CONNECTION` | default connection | Connection for the tokens table |
+| `ENVIRONMENT_GATE_DB_TABLE` | `environment_gate_tokens` | Tokens table name |
+| `ENVIRONMENT_GATE_DB_TABLE_PREFIX` | | Prefix for the tokens table |
+| `ENVIRONMENT_GATE_DB_CACHE_SECONDS` | `300` | Cache for token lookups on cookie requests (`0` disables) |
+| `ENVIRONMENT_GATE_DB_CACHE_STORE` | default store | Cache store for token lookups |
 | `ENVIRONMENT_GATE_COOKIE` | `environment_gate` | Cookie name |
 | `ENVIRONMENT_GATE_COOKIE_DOMAIN` | current host | e.g. `.example.com` to cover `staging.` and `staging-api.` with one unlock |
 | `ENVIRONMENT_GATE_COOKIE_LIFETIME` | `43200` | Minutes (30 days) |
@@ -127,7 +183,7 @@ English and Danish translations are included and follow the app locale.
 
 ### Events and logging
 
-- `FullSmack\EnvironmentGate\Events\EnvironmentUnlocked` (`label`, `via`: `link` | `form` | `header`, `request`)
+- `FullSmack\EnvironmentGate\Events\EnvironmentUnlocked` (`label`, `via`: `link` | `form` | `header`, `request`, `source`: `config` | `database`)
 - `FullSmack\EnvironmentGate\Events\UnlockFailed` (`via`, `request`)
 
 Unlocks are logged at `info` with the label and IP, never the code. Header unlocks are logged at `debug` because they happen on every machine request. Failed attempts are logged at `notice`.

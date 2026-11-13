@@ -2,14 +2,19 @@
 
 namespace FullSmack\EnvironmentGate;
 
+use FullSmack\EnvironmentGate\Contracts\CredentialProvider;
 use RuntimeException;
 
 /**
  * Issues and verifies access cookie values of the form
- * "<label>.<expires>.<hmac(label, expires, code)>".
+ * "<label>.<expires>.<envelope>.<signature>".
  *
- * Because the code itself is part of the signed payload, rotating or
- * removing a code invalidates every cookie issued for it.
+ * - envelope:  hmac(key, label, expires). Verified first using only the key,
+ *              so forged or garbage cookies never cause a credential lookup
+ *              (which may hit the database).
+ * - signature: hmac(key, label, expires, secret). Because the credential's
+ *              secret is part of it, rotating or revoking a code or token
+ *              invalidates every cookie issued for it.
  */
 final class CookieSigner
 {
@@ -23,44 +28,59 @@ final class CookieSigner
         }
     }
 
-    public function issue(string $label, string $code, int $expiresAt): string
+    public function issue(Credential $credential, int $expiresAt): string
     {
-        return $label.'.'.$expiresAt.'.'.$this->signature($label, $code, $expiresAt);
+        return implode('.', [
+            $credential->label,
+            $expiresAt,
+            $this->envelope($credential->label, $expiresAt),
+            $this->signature($credential->label, $expiresAt, $credential->secret),
+        ]);
     }
 
     /**
-     * Return the label of a valid, unexpired cookie value, or null.
+     * Return the credential behind a valid, unexpired cookie value, or null.
      */
-    public function verify(string $value, Codes $codes, int $now): ?string
+    public function verify(string $value, CredentialProvider $credentials, int $now): ?Credential
     {
         $parts = explode('.', $value);
 
-        if (count($parts) !== 3)
+        if (count($parts) !== 4)
         {
             return null;
         }
 
-        [$label, $expiresAt, $signature] = $parts;
+        [$label, $expiresAt, $envelope, $signature] = $parts;
 
         if (! ctype_digit($expiresAt) || (int) $expiresAt <= $now)
         {
             return null;
         }
 
-        $code = $codes->get($label);
-
-        if ($code === null)
+        if (! hash_equals($this->envelope($label, (int) $expiresAt), $envelope))
         {
             return null;
         }
 
-        return hash_equals($this->signature($label, $code, (int) $expiresAt), $signature)
-            ? $label
+        $credential = $credentials->find($label);
+
+        if ($credential === null || ($credential->expiresAt !== null && $credential->expiresAt <= $now))
+        {
+            return null;
+        }
+
+        return hash_equals($this->signature($label, (int) $expiresAt, $credential->secret), $signature)
+            ? $credential
             : null;
     }
 
-    private function signature(string $label, string $code, int $expiresAt): string
+    private function envelope(string $label, int $expiresAt): string
     {
-        return hash_hmac('sha256', "environment-gate\n{$label}\n{$expiresAt}\n{$code}", $this->key);
+        return hash_hmac('sha256', "environment-gate:envelope\n{$label}\n{$expiresAt}", $this->key);
+    }
+
+    private function signature(string $label, int $expiresAt, string $secret): string
+    {
+        return hash_hmac('sha256', "environment-gate:signature\n{$label}\n{$expiresAt}\n{$secret}", $this->key);
     }
 }

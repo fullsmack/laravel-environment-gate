@@ -10,6 +10,8 @@ abstract class TestCase extends Orchestra
 {
     protected bool $gateEnabled = true;
 
+    protected bool $databaseTokens = false;
+
     protected function getPackageProviders($app): array
     {
         return [EnvironmentGateServiceProvider::class];
@@ -22,6 +24,13 @@ abstract class TestCase extends Orchestra
         $app['config']->set('environment-gate.enabled', $this->gateEnabled);
         $app['config']->set('environment-gate.codes', 'alice:alice-secret-code,client-acme:acme-secret-code');
         $app['config']->set('environment-gate.except', ['up', 'webhooks/*']);
+        $app['config']->set('environment-gate.database.enabled', $this->databaseTokens);
+        $app['config']->set('database.default', 'testing');
+        $app['config']->set('database.connections.testing', [
+            'driver' => 'sqlite',
+            'database' => ':memory:',
+            'prefix' => '',
+        ]);
     }
 
     protected function defineRoutes($router): void

@@ -18,10 +18,9 @@ class GateTest extends TestCase
 
     private function validCookie(string $label = 'alice', ?int $expiresAt = null): string
     {
-        $codes = $this->app->make(Codes::class);
+        $credential = $this->app->make(Codes::class)->find($label);
 
-        return $this->app->make(CookieSigner::class)
-            ->issue($label, (string) $codes->get($label), $expiresAt ?? time() + 3600);
+        return $this->app->make(CookieSigner::class)->issue($credential, $expiresAt ?? time() + 3600);
     }
 
     public function test_middleware_is_registered_globally_when_enabled(): void
@@ -201,10 +200,11 @@ class GateTest extends TestCase
 
     public function test_tampered_cookie_is_rejected(): void
     {
-        [$label, $expires, $signature] = explode('.', $this->validCookie('alice'));
+        [$label, $expires, $envelope, $signature] = explode('.', $this->validCookie('alice'));
 
-        $this->withUnencryptedCookie(self::COOKIE, "client-acme.{$expires}.{$signature}")->get('/dashboard')->assertForbidden();
-        $this->withUnencryptedCookie(self::COOKIE, "{$label}.".($expires + 999999).".{$signature}")->get('/dashboard')->assertForbidden();
+        $this->withUnencryptedCookie(self::COOKIE, "client-acme.{$expires}.{$envelope}.{$signature}")->get('/dashboard')->assertForbidden();
+        $this->withUnencryptedCookie(self::COOKIE, "{$label}.".($expires + 999999).".{$envelope}.{$signature}")->get('/dashboard')->assertForbidden();
+        $this->withUnencryptedCookie(self::COOKIE, "{$label}.{$expires}.{$envelope}.".str_repeat('0', 64))->get('/dashboard')->assertForbidden();
         $this->withUnencryptedCookie(self::COOKIE, 'garbage')->get('/dashboard')->assertForbidden();
     }
 

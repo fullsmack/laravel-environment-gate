@@ -3,6 +3,8 @@
 namespace FullSmack\EnvironmentGate\Console;
 
 use FullSmack\EnvironmentGate\Codes;
+use FullSmack\EnvironmentGate\Database\TokenRepository;
+use FullSmack\EnvironmentGate\Database\TokenTable;
 use Illuminate\Console\Command;
 
 class LinkCommand extends Command
@@ -13,7 +15,7 @@ class LinkCommand extends Command
 
     protected $description = 'Print a shareable link that unlocks the environment gate';
 
-    public function handle(Codes $codes): int
+    public function handle(Codes $codes, TokenRepository $tokens): int
     {
         $label = (string) $this->argument('label');
         $parameter = config('environment-gate.query_parameter');
@@ -27,6 +29,16 @@ class LinkCommand extends Command
 
         if (! $codes->has($label))
         {
+            if (TokenTable::active() && rescue(fn () => $tokens->exists($label), false, false))
+            {
+                $this->components->error(
+                    "[{$label}] is a database token. Only its hash is stored, so the link is shown once, when the token is created. "
+                    .'Run environment-gate:token:create again to replace it.',
+                );
+
+                return self::FAILURE;
+            }
+
             $this->components->error("No code is configured for label [{$label}].");
 
             if ($codes->labels() !== [])
@@ -37,15 +49,22 @@ class LinkCommand extends Command
             return self::FAILURE;
         }
 
-        $url = (string) ($this->option('url') ?: config('app.url'));
+        $this->line(static::buildLink(
+            (string) ($this->option('url') ?: config('app.url')),
+            $parameter,
+            (string) $codes->get($label),
+        ));
 
+        return self::SUCCESS;
+    }
+
+    public static function buildLink(string $url, string $parameter, string $code): string
+    {
         if (parse_url($url, PHP_URL_PATH) === null && ! str_contains($url, '?'))
         {
             $url .= '/';
         }
 
-        $this->line($url.(str_contains($url, '?') ? '&' : '?').http_build_query([$parameter => $codes->get($label)]));
-
-        return self::SUCCESS;
+        return $url.(str_contains($url, '?') ? '&' : '?').http_build_query([$parameter => $code]);
     }
 }
