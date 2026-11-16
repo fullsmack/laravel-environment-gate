@@ -12,7 +12,7 @@ Lock staging, demo and preview environments behind a shareable access gate, **wi
 - **Database tokens** (optional): issue, list and revoke tokens from the CLI without redeploying.
 - Only HTTP requests are gated. Queues, the scheduler and Artisan keep running.
 
-It's built for [Laravel Vapor](https://vapor.laravel.com) but works on any platform (Forge, Cloud, Docker, shared hosting).
+It works on any platform (Forge, Vapor, Cloud, Docker, shared hosting).
 
 Supports Laravel 10, 11, 12 and 13 on PHP 8.1+.
 
@@ -28,7 +28,7 @@ Then switch the gate on with environment variables in the environments you want 
 
 ```dotenv
 ENVIRONMENT_GATE_ENABLED=true
-ENVIRONMENT_GATE_CODES=nicolai:k3x9Qm2LrT8wZp4Y,client-acme:p8q2Vn6HjD1sXc7B
+ENVIRONMENT_GATE_CODES=username:k3x9Qm2LrT8wZp4Y,client-acme:p8q2Vn6HjD1sXc7B
 ```
 
 Leave `ENVIRONMENT_GATE_ENABLED` unset in production. With the gate disabled, no middleware is registered and no headers are added.
@@ -46,18 +46,18 @@ Print a shareable link for a label:
 php artisan environment-gate:link client-acme
 # https://staging.example.com/?access=p8q2Vn6HjD1sXc7B
 
-php artisan environment-gate:link client-acme --url=https://staging.example.com/events/42
+php artisan environment-gate:link client-acme --url=https://staging.example.com/orders/42
 ```
 
 ## Database tokens
 
-Env codes need a redeploy to change on Vapor. To issue and revoke access on the fly, store tokens in the database instead, or alongside the env codes.
+Env codes need a redeploy to change. To issue and revoke access on the fly, store tokens in the database instead, or alongside the env codes.
 
 ```dotenv
 ENVIRONMENT_GATE_DATABASE=true
 ```
 
-Database tokens are only active where **both** `ENVIRONMENT_GATE_ENABLED` and `ENVIRONMENT_GATE_DATABASE` are true. Only there does the package load its migration, so `php artisan migrate` (including Vapor's deploy hook) creates the table on staging and demo, and never in production or anywhere else the gate is off.
+Database tokens are only active where **both** `ENVIRONMENT_GATE_ENABLED` and `ENVIRONMENT_GATE_DATABASE` are true. Only there does the package load its migration, so `php artisan migrate` creates the table on staging and demo, and never in production or anywhere else the gate is off.
 
 To keep the migration in your app instead, publish it with `php artisan vendor:publish --tag=environment-gate-migrations`. The published copy has a `shouldRun()` guard, so on Laravel 12+ it's skipped where the package isn't enabled. A skipped migration isn't recorded as run, so it still runs if you enable the package there later. Laravel 10 and 11 don't support `shouldRun()` and would create the empty table everywhere, so prefer the default (unpublished) migration there.
 
@@ -78,8 +78,6 @@ php artisan environment-gate:token:revoke client-acme                    # logs 
 php artisan environment-gate:token:revoke --expired                      # clean up expired tokens
 ```
 
-On Vapor, run the same commands with `vapor command staging --command="environment-gate:token:create client-acme --expires=30"`. The output, which includes the token, is visible in the Vapor command log.
-
 How tokens work:
 
 - **Only a SHA-256 hash is stored.** The token is shown once, when you create it, and `environment-gate:link` can't print it later.
@@ -90,7 +88,7 @@ How tokens work:
 Lookups and performance:
 
 - A request without a cookie never queries the database, and neither does a forged cookie. Cookies carry a second signature that only uses the key, which is checked before any lookup.
-- Requests with a valid cookie look the token up by label. The result is cached for `ENVIRONMENT_GATE_DB_CACHE_SECONDS` (default 300) in the default cache store, which is DynamoDB on Vapor. Revoking or replacing a token from the CLI clears its cache entry right away.
+- Requests with a valid cookie look the token up by label. The result is cached for `ENVIRONMENT_GATE_DB_CACHE_SECONDS` (default 300) in the default cache store. Revoking or replacing a token from the CLI clears its cache entry right away.
 - If the table is missing or the database is unreachable, the gate fails closed: database tokens are rejected and a warning is logged, but env codes keep working.
 
 ## How it works
@@ -188,20 +186,11 @@ English and Danish translations are included and follow the app locale.
 
 Unlocks are logged at `info` with the label and IP, never the code. Header unlocks are logged at `debug` because they happen on every machine request. Failed attempts are logged at `notice`.
 
-## Laravel Vapor
+## Deployment notes
 
-**Queues and the scheduler keep running.** Vapor runs queue jobs and `schedule:run` in separate Lambda invocations that never go through the HTTP kernel, so this middleware never sees them. That's the main reason to use this package instead of `vapor down`. Keep `vapor down` and maintenance mode for real maintenance.
+**Queues and the scheduler keep running.** Queue workers and `schedule:run` never go through the HTTP kernel, so this middleware never sees them. Keep maintenance mode for real maintenance.
 
-**Setting it up per environment:**
-
-```bash
-vapor env:pull staging
-# add ENVIRONMENT_GATE_ENABLED=true and ENVIRONMENT_GATE_CODES=... to .env.staging
-vapor env:push staging
-vapor deploy staging
-```
-
-Repeat for `demo` and any other environment you want locked. Production stays untouched.
+**Per environment.** Set `ENVIRONMENT_GATE_ENABLED=true` and `ENVIRONMENT_GATE_CODES` in each environment you want locked (staging, demo, previews). Production stays untouched.
 
 **Separate API subdomain.** If the frontend lives on `staging.example.com` and the API on `staging-api.example.com`, set `ENVIRONMENT_GATE_COOKIE_DOMAIN=.example.com` so one unlock covers both. Requests with credentials (`fetch(..., {credentials: 'include'})`, `axios` `withCredentials`) then send the cookie. CORS preflights pass without a cookie by design.
 
@@ -217,11 +206,16 @@ The header doesn't touch `Authorization`, so Sanctum bearer tokens keep working.
 
 **Webhooks.** Payment and mail providers can't unlock, so except their routes: `ENVIRONMENT_GATE_EXCEPT=webhooks/*,stripe/webhook`.
 
-**Signed storage URLs.** `vapor/signed-storage-url` is called from the browser of an unlocked user, so the cookie is sent and it works through the gate. Except it only if you call it from somewhere that can't carry the cookie.
+**Throttling** uses the default cache store, and only on requests that actually submit a code.
 
-**Throttling** uses the default cache store (DynamoDB on Vapor), and only on requests that actually submit a code.
+**IP allowlist** relies on `$request->ip()`. Behind a load balancer or CDN, make sure `TrustProxies` trusts your proxies.
 
-**IP allowlist** relies on `$request->ip()`. Make sure `TrustProxies` trusts Vapor's proxies (`$middleware->trustProxies(at: '*')` on Laravel 11+).
+### Laravel Vapor
+
+- Queue jobs and `schedule:run` run in separate Lambda invocations, so the gate is a drop-in replacement for `vapor down` on staging and demo.
+- Database token commands print the token, so it shows up in the Vapor command log.
+- `vapor/signed-storage-url` is called from the browser of an unlocked user, so the cookie is sent and it works through the gate. Except it only if you call it from somewhere that can't carry the cookie.
+- Trust Vapor's proxies for the IP allowlist: `$middleware->trustProxies(at: '*')` on Laravel 11+.
 
 ## Testing your own app
 
